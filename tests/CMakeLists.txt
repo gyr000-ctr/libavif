@@ -266,6 +266,7 @@ if(AVIF_BUILD_APPS)
     add_cmd_test(test_cmd_lossless ${CMAKE_CURRENT_SOURCE_DIR}/data)
     add_cmd_test(test_cmd_metadata ${CMAKE_CURRENT_SOURCE_DIR}/data)
     add_cmd_test(test_cmd_progressive ${CMAKE_CURRENT_SOURCE_DIR}/data)
+    add_cmd_test(test_cmd_remux ${CMAKE_CURRENT_SOURCE_DIR}/data)
     add_cmd_test(test_cmd_stdin ${CMAKE_CURRENT_SOURCE_DIR}/data)
     add_cmd_test(test_cmd_targetsize ${CMAKE_CURRENT_SOURCE_DIR}/data)
     add_cmd_test(test_cmd_transform ${CMAKE_CURRENT_SOURCE_DIR}/data)
@@ -311,6 +312,9 @@ if(AVIF_BUILD_APPS)
         # Only aom encoder supports encoding AV1 spatial layers (used to implement
         # AVIF layered images that can be progressively decoded).
         set_property(TEST test_cmd_progressive PROPERTY DISABLED True)
+
+        # test_cmd_remux uses avifenc to produce the AVIF inputs it remuxes.
+        set_property(TEST test_cmd_remux PROPERTY DISABLED True)
 
         message(STATUS "Some tests are disabled because aom is unavailable for encoding.")
     endif()

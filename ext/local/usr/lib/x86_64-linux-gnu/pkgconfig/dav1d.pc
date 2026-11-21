@@ -1,0 +1,10 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/x86_64-linux-gnu
+
+Name: libdav1d
+Description: AV1 decoding library
+Version: 1.5.3
+Libs: -L${libdir} -ldav1d
+Libs.private: -pthread -ldl
+Cflags: -I${includedir}

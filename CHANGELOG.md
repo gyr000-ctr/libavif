@@ -10,6 +10,13 @@ The changes are relative to the previous release, unless the baseline is specifi
 
 ### Added since 1.4.2
 
+* Add the avifRemuxer API and the avifremux app to rewrite the container of a
+  single-image AVIF without re-encoding its AV1 payloads. It can modify the
+  clap/irot/imir/pasp properties, the ICC 'colr' box and the Exif/XMP items
+  while copying every 'mdat' box byte-for-byte. Grid images, image sequences
+  and items without extents are rejected with dedicated error codes
+  (AVIF_RESULT_REMUX_GRID_NOT_SUPPORTED, AVIF_RESULT_REMUX_SEQUENCE_NOT_SUPPORTED,
+  AVIF_RESULT_ITEM_MISSING_EXTENT and AVIF_RESULT_REMUX_UNSUPPORTED_CONSTRUCTION).
 * Add the ignoreICC option to avifDecoder
 * Support ignoring alpha in avifDecoder::imageContentToDecode
 * Support encoding layered image with pre-scaled inputs

@@ -20,6 +20,7 @@ struct UniquePtrDeleter
 {
     void operator()(avifDecoder * decoder) const { avifDecoderDestroy(decoder); }
     void operator()(avifEncoder * encoder) const { avifEncoderDestroy(encoder); }
+    void operator()(avifRemuxer * remuxer) const { avifRemuxerDestroy(remuxer); }
     void operator()(avifGainMap * gainMap) const { avifGainMapDestroy(gainMap); }
     void operator()(avifImage * image) const { avifImageDestroy(image); }
 };
@@ -27,6 +28,7 @@ struct UniquePtrDeleter
 // Use these unique_ptr to ensure the structs are automatically destroyed.
 using DecoderPtr = std::unique_ptr<avifDecoder, UniquePtrDeleter>;
 using EncoderPtr = std::unique_ptr<avifEncoder, UniquePtrDeleter>;
+using RemuxerPtr = std::unique_ptr<avifRemuxer, UniquePtrDeleter>;
 using GainMapPtr = std::unique_ptr<avifGainMap, UniquePtrDeleter>;
 using ImagePtr = std::unique_ptr<avifImage, UniquePtrDeleter>;
 

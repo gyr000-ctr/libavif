@@ -109,6 +109,10 @@ const char * avifResultToString(avifResult result)
         case AVIF_RESULT_INVALID_TONE_MAPPED_IMAGE:      return "Invalid tone mapped image item";
         case AVIF_RESULT_ENCODE_SAMPLE_TRANSFORM_FAILED: return "Encoding of sample transformed image failed";
         case AVIF_RESULT_DECODE_SAMPLE_TRANSFORM_FAILED: return "Decoding of sample transformed image failed";
+        case AVIF_RESULT_REMUX_GRID_NOT_SUPPORTED:       return "Remux of grid images is not supported";
+        case AVIF_RESULT_REMUX_SEQUENCE_NOT_SUPPORTED:   return "Remux of image sequences is not supported";
+        case AVIF_RESULT_ITEM_MISSING_EXTENT:            return "Item has no extent";
+        case AVIF_RESULT_REMUX_UNSUPPORTED_CONSTRUCTION: return "Remux of this iloc construction method is not supported";
         case AVIF_RESULT_UNKNOWN_ERROR:
         default:
             break;

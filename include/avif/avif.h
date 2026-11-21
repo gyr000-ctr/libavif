@@ -198,6 +198,10 @@ typedef enum AVIF_NODISCARD avifResult
     AVIF_RESULT_INVALID_TONE_MAPPED_IMAGE = 32,
     AVIF_RESULT_ENCODE_SAMPLE_TRANSFORM_FAILED = 33,
     AVIF_RESULT_DECODE_SAMPLE_TRANSFORM_FAILED = 34,
+    AVIF_RESULT_REMUX_GRID_NOT_SUPPORTED = 35,       // Remux of a grid image is not supported
+    AVIF_RESULT_REMUX_SEQUENCE_NOT_SUPPORTED = 36,   // Remux of an image sequence (track-based file) is not supported
+    AVIF_RESULT_ITEM_MISSING_EXTENT = 37,            // An item has no extent to locate its payload
+    AVIF_RESULT_REMUX_UNSUPPORTED_CONSTRUCTION = 38, // An item uses an iloc construction method that cannot be remuxed
 
     // Kept for backward compatibility; please use the symbols above instead.
     AVIF_RESULT_NO_AV1_ITEMS_FOUND = AVIF_RESULT_MISSING_IMAGE_ITEM
@@ -1715,6 +1719,92 @@ AVIF_API avifResult avifEncoderSetCodecSpecificOption(avifEncoder * encoder, con
 
 // Returns the size in bytes of the AV1 image item containing gain map samples, or 0 if no gain map was encoded.
 AVIF_API size_t avifEncoderGetGainMapSizeBytes(avifEncoder * encoder);
+
+// ---------------------------------------------------------------------------
+// avifRemuxer
+//
+// A remuxer rewrites the ISOBMFF container of a single-image AVIF file without
+// decoding or re-encoding the AV1 payloads. Only transformative and colour
+// properties (clap, irot, imir, pasp, colr/ICC) and metadata items (Exif, XMP)
+// can be changed. Every MediaDataBox ('mdat') of the input file is copied to
+// the output byte-for-byte: the encoded image payloads are never touched.
+//
+// Typical usage:
+//
+//   avifRemuxer * remuxer = avifRemuxerCreate();
+//   avifRemuxerSetIrot(remuxer, angle);
+//   avifRemuxerSetICC(remuxer, icc, iccSize);
+//   avifResult result = avifRemuxerRun(remuxer, &input, &output);
+//   avifRemuxerDestroy(remuxer);
+//
+// Grid images, image sequences (track-based files) and items without extents
+// are rejected with dedicated error codes. The normal decode/encode paths are
+// unaffected by this API.
+
+typedef enum avifRemuxMetadataAction
+{
+    AVIF_REMUX_METADATA_KEEP = 0,    // Keep the existing item (default).
+    AVIF_REMUX_METADATA_REMOVE = 1,  // Remove the item, if present.
+    AVIF_REMUX_METADATA_REPLACE = 2  // Replace the item payload (or add it if absent).
+} avifRemuxMetadataAction;
+
+typedef struct avifRemuxer
+{
+    // Transformative properties of the primary image item.
+    // When a transform flag is set in transformFlags, the corresponding property
+    // is replaced (or added if absent); when unset, any existing property is kept.
+    avifTransformFlags transformFlags;
+    avifImageRotation irot;
+    avifImageMirror imir;
+    avifCleanApertureBox clap;
+    avifPixelAspectRatioBox pasp;
+
+    // ICC profile ('colr' box of type 'prof' or 'rICC').
+    // If iccAction is AVIF_REMUX_METADATA_REPLACE and icc.data is NULL/empty, the
+    // ICC profile is removed instead. An existing 'nclx' colour box is always kept.
+    avifRemuxMetadataAction iccAction;
+    avifRWData icc;
+
+    // Exif metadata item.
+    avifRemuxMetadataAction exifAction;
+    avifRWData exif;
+
+    // XMP metadata item.
+    avifRemuxMetadataAction xmpAction;
+    avifRWData xmp;
+
+    // Optional diagnostics. Ignored if NULL.
+    avifDiagnostics * diag;
+} avifRemuxer;
+
+// Creates a remuxer initialized with default settings (all metadata and
+// properties are kept). Returns NULL if a memory allocation failed.
+AVIF_NODISCARD AVIF_API avifRemuxer * avifRemuxerCreate(void);
+AVIF_API void avifRemuxerDestroy(avifRemuxer * remuxer);
+
+// Convenience setters. Each one enables the corresponding change in the remuxer.
+AVIF_API avifResult avifRemuxerSetIrot(avifRemuxer * remuxer, uint8_t angle); // angle in [0,3], counterclockwise 90-degree steps
+AVIF_API avifResult avifRemuxerSetImir(avifRemuxer * remuxer, uint8_t axis); // axis in [0,1], see avifImageMirror
+AVIF_API avifResult avifRemuxerSetClap(avifRemuxer * remuxer, const avifCleanApertureBox * clap);
+AVIF_API avifResult avifRemuxerSetPasp(avifRemuxer * remuxer, uint32_t hSpacing, uint32_t vSpacing);
+AVIF_API avifResult avifRemuxerSetICC(avifRemuxer * remuxer, const uint8_t * icc, size_t iccSize);
+AVIF_API avifResult avifRemuxerRemoveICC(avifRemuxer * remuxer);
+AVIF_API avifResult avifRemuxerSetExif(avifRemuxer * remuxer, const uint8_t * exif, size_t exifSize);
+AVIF_API avifResult avifRemuxerRemoveExif(avifRemuxer * remuxer);
+AVIF_API avifResult avifRemuxerSetXMP(avifRemuxer * remuxer, const uint8_t * xmp, size_t xmpSize);
+AVIF_API avifResult avifRemuxerRemoveXMP(avifRemuxer * remuxer);
+
+// Rewrites the container of 'input' into 'output' without touching the AV1
+// payloads. On success, 'output' must be freed with avifRWDataFree().
+//
+// Possible errors include:
+// * AVIF_RESULT_BMFF_PARSE_FAILED - the input is not a parsable ISOBMFF file.
+// * AVIF_RESULT_REMUX_GRID_NOT_SUPPORTED - the primary item is a grid image.
+// * AVIF_RESULT_REMUX_SEQUENCE_NOT_SUPPORTED - the file contains movie tracks.
+// * AVIF_RESULT_ITEM_MISSING_EXTENT - an item that must be kept has no iloc extent.
+// * AVIF_RESULT_REMUX_UNSUPPORTED_CONSTRUCTION - idat/item-offset construction is used.
+// * AVIF_RESULT_INVALID_EXIF_PAYLOAD - a replacement Exif payload has no TIFF header.
+AVIF_NODISCARD AVIF_API avifResult avifRemuxerRun(avifRemuxer * remuxer, const avifROData * input, avifRWData * output);
 
 // Helpers
 AVIF_NODISCARD AVIF_API avifBool avifImageUsesU16(const avifImage * image);
