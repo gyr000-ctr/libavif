@@ -198,6 +198,8 @@ typedef enum AVIF_NODISCARD avifResult
     AVIF_RESULT_INVALID_TONE_MAPPED_IMAGE = 32,
     AVIF_RESULT_ENCODE_SAMPLE_TRANSFORM_FAILED = 33,
     AVIF_RESULT_DECODE_SAMPLE_TRANSFORM_FAILED = 34,
+    AVIF_RESULT_INVALID_REGION = 35,        // The requested decode region is empty or lies outside of the image.
+    AVIF_RESULT_REGION_NOT_SUPPORTED = 36, // Region decoding cannot be used with this image's layout or decoder settings.
 
     // Kept for backward compatibility; please use the symbols above instead.
     AVIF_RESULT_NO_AV1_ITEMS_FOUND = AVIF_RESULT_MISSING_IMAGE_ITEM
@@ -575,6 +577,21 @@ avifCropRectConvertCleanApertureBox(avifCropRect *, const avifCleanApertureBox *
 // Deprecated. Use avifCleanApertureBoxFromCropRect() instead.
 AVIF_NODISCARD AVIF_API avifBool
 avifCleanApertureBoxConvertCropRect(avifCleanApertureBox *, const avifCropRect *, uint32_t, uint32_t, avifPixelFormat, avifDiagnostics *);
+
+// ---------------------------------------------------------------------------
+// avifDecodeRegion - Partial (region) decoding of grid images
+
+// A rectangular region of the image, expressed in pixels of the reconstructed (full grid) image,
+// to decode with avifDecoderSetDecodeRegion(). Only the grid tiles intersecting this rectangle are
+// decoded, and decoder->image after avifDecoderNextImage()/avifDecoderNthImage() contains exactly
+// the requested rectangle.
+typedef struct avifDecodeRegion
+{
+    uint32_t x;      // Column of the leftmost pixel of the region, 0-based.
+    uint32_t y;      // Row of the topmost pixel of the region, 0-based.
+    uint32_t width;  // Width of the region, in pixels. Must be > 0.
+    uint32_t height; // Height of the region, in pixels. Must be > 0.
+} avifDecodeRegion;
 
 // ---------------------------------------------------------------------------
 // avifContentLightLevelInformationBox
@@ -1396,6 +1413,17 @@ typedef struct avifDecoder
     // Enable this to avoid reading and surfacing ICC profile to the decoded avifImage and gain map
     // metadata.
     avifBool ignoreICC;
+
+    // When set (width and height both non-zero), only the grid tiles intersecting the given image
+    // rectangle are decoded, and the decoded image is cropped to that rectangle. The coordinates are
+    // in pixels of the full reconstructed image. For chroma-subsampled formats, x and y must be
+    // aligned to the chroma sample locations (even coordinates for 4:2:0/4:2:2).
+    // Only still, single-layer grid images are supported; image sequences, progressive images,
+    // incremental decoding and Sample Transforms cannot be combined with region decoding.
+    // Use avifDecoderSetDecodeRegion() to set this field and avifDecoderClearDecodeRegion() to
+    // restore full-image decoding.
+    avifDecodeRegion decodeRegion;
+    avifBool decodeRegionEnabled;
 } avifDecoder;
 
 // Creates a decoder initialized with default settings values.
@@ -1445,6 +1473,26 @@ AVIF_API avifResult avifDecoderParse(avifDecoder * decoder);
 AVIF_API avifResult avifDecoderNextImage(avifDecoder * decoder);
 AVIF_API avifResult avifDecoderNthImage(avifDecoder * decoder, uint32_t frameIndex);
 AVIF_API avifResult avifDecoderReset(avifDecoder * decoder);
+
+// Requests that subsequent calls to avifDecoderNextImage()/avifDecoderNthImage() decode only the
+// grid tiles intersecting the given rectangle (in pixels of the full reconstructed image) and crop
+// the decoded image to it. Must be called after a successful avifDecoderParse().
+// Returns AVIF_RESULT_INVALID_ARGUMENT if region is NULL or has a zero width/height,
+// AVIF_RESULT_INVALID_REGION if the rectangle is outside the image or misaligned for the image's
+// chroma sampling, and AVIF_RESULT_REGION_NOT_SUPPORTED if the image layout or decoder settings
+// (non-grid image, overlapping/irregular grid, image sequence, progressive image, incremental
+// decoding, Sample Transforms) cannot be region-decoded.
+AVIF_API avifResult avifDecoderSetDecodeRegion(avifDecoder * decoder, const avifDecodeRegion * region);
+// Restores full-image decoding after a previous call to avifDecoderSetDecodeRegion().
+AVIF_API void avifDecoderClearDecodeRegion(avifDecoder * decoder);
+
+// Returns the number of grid tiles that make up the current (or most recently decoded) image.
+// May be called after a successful avifDecoderParse(). Returns 0 for non-grid images.
+AVIF_API uint32_t avifDecoderGetTileCount(const avifDecoder * decoder);
+// Returns the number of grid tiles that were actually decoded during the most recent successful
+// avifDecoderNextImage()/avifDecoderNthImage() call. With region decoding enabled this equals the
+// number of tiles intersecting the requested region; otherwise it equals avifDecoderGetTileCount().
+AVIF_API uint32_t avifDecoderGetDecodedTileCount(const avifDecoder * decoder);
 
 // Keyframe information
 // frameIndex - 0-based, matching avifDecoder->imageIndex, bound by avifDecoder->imageCount

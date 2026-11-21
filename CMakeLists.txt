@@ -120,6 +120,7 @@ set_local_or_system_option(
 )
 
 option(AVIF_BUILD_APPS "Build avif apps." OFF)
+option(AVIF_BUILD_GAINMAP_UTIL "Build the avifgainmaputil app. Requires libargparse. Has no effect unless AVIF_BUILD_APPS is ON." ON)
 option(AVIF_BUILD_TESTS "Build avif tests." OFF)
 option(
     AVIF_ENABLE_COMPLIANCE_WARDEN
@@ -714,38 +715,49 @@ if(AVIF_BUILD_APPS)
     endif()
     target_link_libraries(avifdec avif_apps avif avif_enable_warnings)
 
-    include(LocalLibargparse)
+    if(AVIF_BUILD_GAINMAP_UTIL)
+        include(LocalLibargparse)
 
-    set(AVIFGAINMAPUTIL_SRCS
-        apps/avifgainmaputil/avifgainmaputil.cc
-        apps/avifgainmaputil/convert_command.cc
-        apps/avifgainmaputil/combine_command.cc
-        apps/avifgainmaputil/extractgainmap_command.cc
-        apps/avifgainmaputil/imageio.cc
-        apps/avifgainmaputil/printmetadata_command.cc
-        apps/avifgainmaputil/tonemap_command.cc
-        apps/avifgainmaputil/program_command.cc
-        apps/avifgainmaputil/swapbase_command.cc
-    )
+        set(AVIFGAINMAPUTIL_SRCS
+            apps/avifgainmaputil/avifgainmaputil.cc
+            apps/avifgainmaputil/convert_command.cc
+            apps/avifgainmaputil/combine_command.cc
+            apps/avifgainmaputil/extractgainmap_command.cc
+            apps/avifgainmaputil/imageio.cc
+            apps/avifgainmaputil/printmetadata_command.cc
+            apps/avifgainmaputil/tonemap_command.cc
+            apps/avifgainmaputil/program_command.cc
+            apps/avifgainmaputil/swapbase_command.cc
+        )
 
-    add_executable(avifgainmaputil "${AVIFGAINMAPUTIL_SRCS}")
-    if(WIN32)
-        if(MSVC)
-            target_sources(avifgainmaputil PRIVATE apps/utf8.manifest)
-        elseif(MINGW)
-            target_sources(avifgainmaputil PRIVATE apps/utf8.rc)
+        add_executable(avifgainmaputil "${AVIFGAINMAPUTIL_SRCS}")
+        if(WIN32)
+            if(MSVC)
+                target_sources(avifgainmaputil PRIVATE apps/utf8.manifest)
+            elseif(MINGW)
+                target_sources(avifgainmaputil PRIVATE apps/utf8.rc)
+            endif()
         endif()
-    endif()
-    set_target_properties(avifgainmaputil PROPERTIES LINKER_LANGUAGE "CXX")
-    target_link_libraries(avifgainmaputil libargparse avif_apps avif avif_enable_warnings)
-    if(AVIF_LIBYUV_ENABLED)
-        target_compile_definitions(avifgainmaputil PRIVATE -DAVIF_LIBYUV_ENABLED=1)
-        target_link_libraries(avifgainmaputil yuv::yuv)
+        set_target_properties(avifgainmaputil PROPERTIES LINKER_LANGUAGE "CXX")
+        target_link_libraries(avifgainmaputil libargparse avif_apps avif avif_enable_warnings)
+        if(AVIF_LIBYUV_ENABLED)
+            target_compile_definitions(avifgainmaputil PRIVATE -DAVIF_LIBYUV_ENABLED=1)
+            target_link_libraries(avifgainmaputil yuv::yuv)
+        endif()
+
+        if(NOT SKIP_INSTALL_APPS AND NOT SKIP_INSTALL_ALL)
+            install(
+                TARGETS avifgainmaputil
+                RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+                ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+                LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+            )
+        endif()
     endif()
 
     if(NOT SKIP_INSTALL_APPS AND NOT SKIP_INSTALL_ALL)
         install(
-            TARGETS avifenc avifdec avifgainmaputil
+            TARGETS avifenc avifdec
             RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
             ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
             LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"

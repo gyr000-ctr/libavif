@@ -53,6 +53,8 @@ static void syntax(void)
     printf("                        0 means unlimited. (Default: %u)\n", AVIF_DEFAULT_IMAGE_SIZE_LIMIT);
     printf("  --dimension-limit C : Maximum image dimension (width or height) that should be tolerated.\n");
     printf("                        0 means unlimited. (Default: %u)\n", AVIF_DEFAULT_IMAGE_DIMENSION_LIMIT);
+    printf("    --region X,Y,W,H : Decode only the grid tiles intersecting the rectangle (in pixels of the\n");
+    printf("                        full image) and crop the output to it. Only supported for still grid images.\n");
     printf("    --                : Signal the end of options. Everything after this is interpreted as file names.\n");
     printf("\n");
     avifPrintVersions();
@@ -109,6 +111,7 @@ int main(int argc, char * argv[])
     avifBool frameIndexSpecified = AVIF_FALSE; // Whether the --index flag was passed.
     uint32_t imageSizeLimit = AVIF_DEFAULT_IMAGE_SIZE_LIMIT;
     uint32_t imageDimensionLimit = AVIF_DEFAULT_IMAGE_DIMENSION_LIMIT;
+    const char * regionArg = NULL;
     avifRWData iccOverride = AVIF_DATA_EMPTY;
 
     if (argc < 2) {
@@ -250,6 +253,9 @@ int main(int argc, char * argv[])
                 return 1;
             }
             imageDimensionLimit = (uint32_t)value;
+        } else if (!strcmp(arg, "--region")) {
+            NEXTARG();
+            regionArg = arg;
         } else if (arg[0] == '-') {
             fprintf(stderr, "ERROR: unrecognized option %s\n\n", arg);
             syntax();
@@ -345,6 +351,22 @@ int main(int argc, char * argv[])
         goto cleanup;
     }
 
+    if (regionArg) {
+        avifDecodeRegion region;
+        if (sscanf(regionArg, "%u,%u,%u,%u", &region.x, &region.y, &region.width, &region.height) != 4 ||
+            region.width == 0 || region.height == 0) {
+            fprintf(stderr,
+                    "ERROR: invalid region '%s', expected X,Y,WIDTH,HEIGHT with positive WIDTH and HEIGHT\n",
+                    regionArg);
+            goto cleanup;
+        }
+        result = avifDecoderSetDecodeRegion(decoder, &region);
+        if (result != AVIF_RESULT_OK) {
+            fprintf(stderr, "ERROR: Failed to set decode region: %s\n", avifResultToString(result));
+            goto cleanup;
+        }
+    }
+
     printf("Image decoded: %s\n", inputFilename);
     avifContainerDump(decoder);
 
@@ -395,6 +417,11 @@ int main(int argc, char * argv[])
                decoder->imageTiming.durationInTimescales,
                decoder->image->width,
                decoder->image->height);
+        if (regionArg) {
+            printf("   * Region decode: %u/%u grid tile(s) decoded\n",
+                   avifDecoderGetDecodedTileCount(decoder),
+                   avifDecoderGetTileCount(decoder));
+        }
         if (infoOnly) {
             ++currIndex;
             if (decodeAllFrames) {

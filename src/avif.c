@@ -109,6 +109,8 @@ const char * avifResultToString(avifResult result)
         case AVIF_RESULT_INVALID_TONE_MAPPED_IMAGE:      return "Invalid tone mapped image item";
         case AVIF_RESULT_ENCODE_SAMPLE_TRANSFORM_FAILED: return "Encoding of sample transformed image failed";
         case AVIF_RESULT_DECODE_SAMPLE_TRANSFORM_FAILED: return "Decoding of sample transformed image failed";
+        case AVIF_RESULT_INVALID_REGION:                 return "Invalid decode region";
+        case AVIF_RESULT_REGION_NOT_SUPPORTED:           return "Region decoding is not supported for this image or settings";
         case AVIF_RESULT_UNKNOWN_ERROR:
         default:
             break;

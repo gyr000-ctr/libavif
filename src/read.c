@@ -1825,10 +1825,199 @@ static avifResult avifDecoderGenerateImageGridTiles(avifDecoder * decoder,
     return AVIF_RESULT_OK;
 }
 
-// Allocates the dstImage. Also verifies some spec compliance rules for grids, if relevant.
-static avifResult avifDecoderDataAllocateImagePlanes(const avifDecoderData * data, const avifTileInfo * info, avifImage * dstImage, avifBool * cicpSet)
+// Returns AVIF_TRUE if a decode region was requested for the given item category. Region decoding
+// only applies to the color and alpha planes of still grid images.
+static avifBool avifDecoderRegionAppliesToCategory(const avifDecoder * decoder, const avifTileInfo * info)
 {
+    if (!decoder->decodeRegionEnabled) {
+        return AVIF_FALSE;
+    }
+    const avifItemCategory category = (avifItemCategory)(info - decoder->data->tileInfos);
+    if (category != AVIF_ITEM_COLOR && category != AVIF_ITEM_ALPHA) {
+        return AVIF_FALSE;
+    }
+    return (info->grid.rows > 0) && (info->grid.columns > 0);
+}
+
+// Region decoding is only defined for the standard, non-overlapping grid layout where every cell
+// has a uniform encoded size equal to its assembly pitch ceil(output / cells). Returns the assembly
+// tile dimensions for such a layout, or AVIF_FALSE for overlapping/irregular layouts.
+static avifBool avifDecoderGetRegionTilePitch(const avifDecoder * decoder,
+                                              const avifTileInfo * info,
+                                              uint32_t * outTileWidth,
+                                              uint32_t * outTileHeight)
+{
+    const avifImageGrid * grid = &info->grid;
+    const avifTile * firstTile = &decoder->data->tiles.tile[info->firstTileIndex];
+    const uint32_t pitchX = (grid->outputWidth + grid->columns - 1) / grid->columns;
+    const uint32_t pitchY = (grid->outputHeight + grid->rows - 1) / grid->rows;
+    // All grid tiles share the same encoded (ispe) size. A tile larger than its assembly pitch
+    // overlaps the next cell (e.g. two 64px tiles in an 80px canvas); a smaller one would leave a
+    // gap. Neither can be addressed with a simple rectangular region, so reject them.
+    if (firstTile->width != pitchX || firstTile->height != pitchY) {
+        return AVIF_FALSE;
+    }
+    *outTileWidth = pitchX;
+    *outTileHeight = pitchY;
+    return AVIF_TRUE;
+}
+
+// Computes the row/column ranges of tiles intersecting the requested decode region.
+static void avifDecoderGetRegionTileBounds(const avifDecoder * decoder,
+                                           const avifTileInfo * info,
+                                           uint32_t * colStart,
+                                           uint32_t * colEnd,
+                                           uint32_t * rowStart,
+                                           uint32_t * rowEnd)
+{
+    const avifDecodeRegion * region = &decoder->decodeRegion;
+    const avifImageGrid * grid = &info->grid;
+    uint32_t tileWidth;
+    uint32_t tileHeight;
+    if (!avifDecoderGetRegionTilePitch(decoder, info, &tileWidth, &tileHeight)) {
+        // Unsupported layouts are rejected earlier in avifDecoderValidateDecodeRegion().
+        *colStart = *colEnd = *rowStart = *rowEnd = 0;
+        return;
+    }
+
+    *colStart = region->x / tileWidth;
+    *colEnd = AVIF_MIN((region->x + region->width - 1) / tileWidth + 1, grid->columns);
+    *rowStart = region->y / tileHeight;
+    *rowEnd = AVIF_MIN((region->y + region->height - 1) / tileHeight + 1, grid->rows);
+}
+
+// Computes the [tileIndexStart, tileIndexEnd) range of tiles intersecting the requested decode
+// region. Tile indices are relative to the item category (0-based), as used by avifTileInfo.
+// Note that tiles strictly inside this index range may still be outside the region (the covered
+// tiles form a sub-grid, not a contiguous range); use avifDecoderIsTileInRegion() per tile.
+static void avifDecoderGetRegionTileRange(const avifDecoder * decoder,
+                                          const avifTileInfo * info,
+                                          unsigned int * tileIndexStart,
+                                          unsigned int * tileIndexEnd)
+{
+    uint32_t colStart;
+    uint32_t colEnd;
+    uint32_t rowStart;
+    uint32_t rowEnd;
+    avifDecoderGetRegionTileBounds(decoder, info, &colStart, &colEnd, &rowStart, &rowEnd);
+
+    *tileIndexStart = rowStart * info->grid.columns + colStart;
+    *tileIndexEnd = (rowEnd - 1) * info->grid.columns + colEnd;
+}
+
+// Returns AVIF_TRUE if the given tile intersects the requested decode region.
+static avifBool avifDecoderIsTileInRegion(const avifDecoder * decoder, const avifTileInfo * info, unsigned int tileIndex)
+{
+    if (!avifDecoderRegionAppliesToCategory(decoder, info)) {
+        return AVIF_TRUE;
+    }
+    uint32_t colStart;
+    uint32_t colEnd;
+    uint32_t rowStart;
+    uint32_t rowEnd;
+    avifDecoderGetRegionTileBounds(decoder, info, &colStart, &colEnd, &rowStart, &rowEnd);
+    const uint32_t col = tileIndex % info->grid.columns;
+    const uint32_t row = tileIndex / info->grid.columns;
+    return (col >= colStart) && (col < colEnd) && (row >= rowStart) && (row < rowEnd);
+}
+
+// Validates the requested decode region against the parsed image and the decoder settings.
+// Called at the beginning of avifDecoderNextImage().
+static avifResult avifDecoderValidateDecodeRegion(avifDecoder * decoder)
+{
+    if (!decoder->decodeRegionEnabled) {
+        return AVIF_RESULT_OK;
+    }
+    const avifDecodeRegion * region = &decoder->decodeRegion;    avifDiagnostics * diag = &decoder->diag;
+
+    if (decoder->allowIncremental) {
+        avifDiagnosticsPrintf(diag, "Region decoding cannot be combined with incremental decoding");
+        return AVIF_RESULT_REGION_NOT_SUPPORTED;
+    }
+    if (decoder->data->source == AVIF_DECODER_SOURCE_TRACKS || decoder->imageCount > 1) {
+        avifDiagnosticsPrintf(diag, "Region decoding is not supported for image sequences or progressive images");
+        return AVIF_RESULT_REGION_NOT_SUPPORTED;
+    }
+    if (decoder->data->meta->sampleTransformExpression.count > 0) {
+        avifDiagnosticsPrintf(diag, "Region decoding is not supported for Sample Transform images");
+        return AVIF_RESULT_REGION_NOT_SUPPORTED;
+    }
+
+    const avifTileInfo * colorInfo = &decoder->data->tileInfos[AVIF_ITEM_COLOR];
+    if (colorInfo->tileCount == 0 || colorInfo->grid.rows == 0 || colorInfo->grid.columns == 0) {
+        avifDiagnosticsPrintf(diag, "Region decoding is only supported for grid images");
+        return AVIF_RESULT_REGION_NOT_SUPPORTED;
+    }
+
+    // Region decoding requires the standard, non-overlapping assembly layout. Reject grids whose
+    // tiles overlap the canvas (their encoded tile is larger than the assembly pitch).
+    for (int c = AVIF_ITEM_COLOR; c <= AVIF_ITEM_ALPHA; ++c) {
+        const avifTileInfo * info = &decoder->data->tileInfos[c];
+        if (info->tileCount == 0 || info->grid.rows == 0 || info->grid.columns == 0) {
+            continue;
+        }
+        uint32_t pitchW;
+        uint32_t pitchH;
+        if (!avifDecoderGetRegionTilePitch(decoder, info, &pitchW, &pitchH)) {
+            avifDiagnosticsPrintf(diag, "Region decoding is not supported for overlapping or irregular grid layouts");
+            return AVIF_RESULT_REGION_NOT_SUPPORTED;
+        }
+    }
+
+    const uint64_t regionRight = (uint64_t)region->x + region->width;
+    const uint64_t regionBottom = (uint64_t)region->y + region->height;
+    if (regionRight > colorInfo->grid.outputWidth || regionBottom > colorInfo->grid.outputHeight) {
+        avifDiagnosticsPrintf(diag,
+                              "Decode region [x=%u, y=%u, w=%u, h=%u] is outside of the image (%ux%u)",
+                              region->x,
+                              region->y,
+                              region->width,
+                              region->height,
+                              colorInfo->grid.outputWidth,
+                              colorInfo->grid.outputHeight);
+        return AVIF_RESULT_INVALID_REGION;
+    }
+
+    // The region origin must be aligned to the chroma sample locations so that the output can be
+    // represented as an avifImage view (see avifImageSetViewRect()). The tile images are not
+    // decoded yet at this point, so use the format already populated on decoder->image during parse.
+    avifPixelFormatInfo formatInfo;
+    avifGetPixelFormatInfo(decoder->image->yuvFormat, &formatInfo);
+    if (!formatInfo.monochrome && ((region->x & formatInfo.chromaShiftX) || (region->y & formatInfo.chromaShiftY))) {
+        avifDiagnosticsPrintf(diag,
+                              "Decode region origin (%u, %u) must be aligned to the chroma sample locations "
+                              "(even coordinates for 4:2:0/4:2:2 images)",
+                              region->x,
+                              region->y);
+        return AVIF_RESULT_INVALID_REGION;
+    }
+
+    const avifTileInfo * alphaInfo = &decoder->data->tileInfos[AVIF_ITEM_ALPHA];
+    if (alphaInfo->tileCount > 0 && alphaInfo->grid.rows > 0 && alphaInfo->grid.columns > 0 &&
+        (alphaInfo->grid.rows != colorInfo->grid.rows || alphaInfo->grid.columns != colorInfo->grid.columns ||
+         alphaInfo->grid.outputWidth != colorInfo->grid.outputWidth || alphaInfo->grid.outputHeight != colorInfo->grid.outputHeight)) {
+        avifDiagnosticsPrintf(diag, "Region decoding is not supported when the alpha grid layout differs from the color grid layout");
+        return AVIF_RESULT_REGION_NOT_SUPPORTED;
+    }
+    return AVIF_RESULT_OK;
+}
+
+// Allocates the dstImage. Also verifies some spec compliance rules for grids, if relevant.
+static avifResult avifDecoderDataAllocateImagePlanes(const avifDecoder * decoder,
+                                                     const avifTileInfo * info,
+                                                     avifImage * dstImage,
+                                                     avifBool * cicpSet)
+{
+    const avifDecoderData * data = decoder->data;
     const avifTile * tile = &data->tiles.tile[info->firstTileIndex];
+    if (avifDecoderRegionAppliesToCategory(decoder, info)) {
+        // The grid's first tile may be skipped by the region and hence not decoded (zero-sized
+        // image). Validate against the first tile that will actually be decoded.
+        unsigned int startTileIndex;
+        unsigned int endTileIndex;
+        avifDecoderGetRegionTileRange(decoder, info, &startTileIndex, &endTileIndex);
+        tile = &data->tiles.tile[info->firstTileIndex + startTileIndex];
+    }
     uint32_t dstWidth;
     uint32_t dstHeight;
 
@@ -1861,6 +2050,11 @@ static avifResult avifDecoderDataAllocateImagePlanes(const avifDecoderData * dat
         }
         dstWidth = grid->outputWidth;
         dstHeight = grid->outputHeight;
+        if (avifDecoderRegionAppliesToCategory(decoder, info)) {
+            // Only allocate the cropped output: no full-grid sized image is ever allocated.
+            dstWidth = decoder->decodeRegion.width;
+            dstHeight = decoder->decodeRegion.height;
+        }
     } else {
         // Only one tile. Width and height are inherited from the 'ispe' property of the corresponding avifDecoderItem.
         dstWidth = tile->width;
@@ -1916,21 +2110,43 @@ static avifResult avifDecoderDataAllocateImagePlanes(const avifDecoderData * dat
 
 // Copies over the pixels from the tile into dstImage.
 // Verifies that the relevant properties of the tile match those of the first tile in case of a grid.
-static avifResult avifDecoderDataCopyTileToImage(avifDecoderData * data,
+// When region is not NULL, only the part of the tile intersecting the decode region is copied and
+// dstImage is the cropped (region-sized) output image.
+static avifResult avifDecoderDataCopyTileToImage(avifDecoder * decoder,
                                                  const avifTileInfo * info,
                                                  avifImage * dstImage,
                                                  const avifTile * tile,
-                                                 unsigned int tileIndex)
+                                                 unsigned int tileIndex,
+                                                 const avifDecodeRegion * region)
 {
+    avifDecoderData * data = decoder->data;
     const avifTile * firstTile = &data->tiles.tile[info->firstTileIndex];
-    if (tile != firstTile) {
+    if (region != NULL) {
+        // In region mode some tiles are never decoded. Grid consistency was already validated
+        // against the grid's first tile during parse; here compare against the first decoded tile.
+        unsigned int startTileIndex;
+        unsigned int endTileIndex;
+        avifDecoderGetRegionTileRange(decoder, info, &startTileIndex, &endTileIndex);
+        const avifTile * firstDecodedTile = firstTile + startTileIndex;
+        if (tile != firstDecodedTile) {
+            if ((tile->image->width != firstDecodedTile->image->width) || (tile->image->height != firstDecodedTile->image->height) ||
+                (tile->image->depth != firstDecodedTile->image->depth) || (tile->image->yuvFormat != firstDecodedTile->image->yuvFormat) ||
+                (tile->image->yuvRange != firstDecodedTile->image->yuvRange) ||
+                (tile->image->colorPrimaries != firstDecodedTile->image->colorPrimaries) ||
+                (tile->image->transferCharacteristics != firstDecodedTile->image->transferCharacteristics) ||
+                (tile->image->matrixCoefficients != firstDecodedTile->image->matrixCoefficients)) {
+                avifDiagnosticsPrintf(&decoder->diag, "Grid image contains mismatched tiles");
+                return AVIF_RESULT_INVALID_IMAGE_GRID;
+            }
+        }
+    } else if (tile != firstTile) {
         // Check for tile consistency. All tiles in a grid image should match the first tile in the properties checked below.
         if ((tile->image->width != firstTile->image->width) || (tile->image->height != firstTile->image->height) ||
             (tile->image->depth != firstTile->image->depth) || (tile->image->yuvFormat != firstTile->image->yuvFormat) ||
             (tile->image->yuvRange != firstTile->image->yuvRange) || (tile->image->colorPrimaries != firstTile->image->colorPrimaries) ||
             (tile->image->transferCharacteristics != firstTile->image->transferCharacteristics) ||
             (tile->image->matrixCoefficients != firstTile->image->matrixCoefficients)) {
-            avifDiagnosticsPrintf(data->diag, "Grid image contains mismatched tiles");
+            avifDiagnosticsPrintf(&decoder->diag, "Grid image contains mismatched tiles");
             return AVIF_RESULT_INVALID_IMAGE_GRID;
         }
     }
@@ -1949,24 +2165,79 @@ static avifResult avifDecoderDataCopyTileToImage(avifDecoderData * data,
         avifImageFreePlanes(&dstView, AVIF_PLANES_A);
     }
 
+    // Tile position in the reconstructed (full grid) image.
+    const avifBool isGrid = (info->grid.rows > 0) && (info->grid.columns > 0);
+    uint32_t tileX = 0;
+    uint32_t tileY = 0;
+    uint32_t tileWidth = firstTile->image->width;
+    uint32_t tileHeight = firstTile->image->height;
+    if (isGrid) {
+        const unsigned int rowIndex = tileIndex / info->grid.columns;
+        const unsigned int colIndex = tileIndex % info->grid.columns;
+        if (region != NULL) {
+            // Region decoding only supports the standard assembly layout, validated in
+            // avifDecoderValidateDecodeRegion(). Use its pitch so skipped (undecoded) tiles and
+            // tiles scaled during decode are placed correctly.
+            uint32_t pitchW;
+            uint32_t pitchH;
+            AVIF_ASSERT_OR_RETURN(avifDecoderGetRegionTilePitch(decoder, info, &pitchW, &pitchH));
+            tileX = pitchW * colIndex;
+            tileY = pitchH * rowIndex;
+            // The decoded tile may be larger than the assembly pitch (overlapping source); only the
+            // first pitchW/pitchH pixels participate in the reconstructed canvas.
+            tileWidth = pitchW;
+            tileHeight = pitchH;
+        } else {
+            // Full-image path: identical placement to the original implementation, including
+            // overlapping grids (e.g. two 64px-high tiles in an 80px canvas).
+            tileX = firstTile->image->width * colIndex;
+            tileY = firstTile->image->height * rowIndex;
+        }
+    }
+
     avifImage srcTileView;
     avifImageSetDefaults(&srcTileView);
     avifImage dstTileView;
     avifImageSetDefaults(&dstTileView);
-    avifCropRect dstTileViewRect = { 0, 0, firstTile->image->width, firstTile->image->height };
-    if (info->grid.rows > 0 && info->grid.columns > 0) {
-        unsigned int rowIndex = tileIndex / info->grid.columns;
-        unsigned int colIndex = tileIndex % info->grid.columns;
-        dstTileViewRect.x = firstTile->image->width * colIndex;
-        dstTileViewRect.y = firstTile->image->height * rowIndex;
-        if (dstTileViewRect.x + dstTileViewRect.width > info->grid.outputWidth) {
-            dstTileViewRect.width = info->grid.outputWidth - dstTileViewRect.x;
+
+    avifCropRect srcTileViewRect;
+    avifCropRect dstTileViewRect;
+    if (region != NULL) {
+        // Intersection of the tile with the requested region, in full-image coordinates.
+        const uint32_t intersectX = AVIF_MAX(tileX, region->x);
+        const uint32_t intersectY = AVIF_MAX(tileY, region->y);
+        const uint32_t intersectRight = AVIF_MIN(tileX + tileWidth, region->x + region->width);
+        const uint32_t intersectBottom = AVIF_MIN(tileY + tileHeight, region->y + region->height);
+        AVIF_ASSERT_OR_RETURN(intersectRight > intersectX && intersectBottom > intersectY);
+        // View into the tile's own pixel buffer.
+        srcTileViewRect.x = intersectX - tileX;
+        srcTileViewRect.y = intersectY - tileY;
+        srcTileViewRect.width = intersectRight - intersectX;
+        srcTileViewRect.height = intersectBottom - intersectY;
+        // Same pixels, expressed in the region-sized destination image.
+        dstTileViewRect.x = intersectX - region->x;
+        dstTileViewRect.y = intersectY - region->y;
+        dstTileViewRect.width = srcTileViewRect.width;
+        dstTileViewRect.height = srcTileViewRect.height;
+    } else {
+        dstTileViewRect.x = tileX;
+        dstTileViewRect.y = tileY;
+        dstTileViewRect.width = tileWidth;
+        dstTileViewRect.height = tileHeight;
+        if (isGrid) {
+            // Edge tiles may extend past the reconstructed canvas; clamp them.
+            if (dstTileViewRect.x + dstTileViewRect.width > info->grid.outputWidth) {
+                dstTileViewRect.width = info->grid.outputWidth - dstTileViewRect.x;
+            }
+            if (dstTileViewRect.y + dstTileViewRect.height > info->grid.outputHeight) {
+                dstTileViewRect.height = info->grid.outputHeight - dstTileViewRect.y;
+            }
         }
-        if (dstTileViewRect.y + dstTileViewRect.height > info->grid.outputHeight) {
-            dstTileViewRect.height = info->grid.outputHeight - dstTileViewRect.y;
-        }
+        srcTileViewRect.x = 0;
+        srcTileViewRect.y = 0;
+        srcTileViewRect.width = dstTileViewRect.width;
+        srcTileViewRect.height = dstTileViewRect.height;
     }
-    const avifCropRect srcTileViewRect = { 0, 0, dstTileViewRect.width, dstTileViewRect.height };
     AVIF_ASSERT_OR_RETURN(avifImageSetViewRect(&dstTileView, &dstView, &dstTileViewRect) == AVIF_RESULT_OK);
     AVIF_ASSERT_OR_RETURN(avifImageSetViewRect(&srcTileView, tile->image, &srcTileViewRect) == AVIF_RESULT_OK);
     avifImageCopySamples(&dstTileView, &srcTileView, avifIsAlpha(tile->input->itemCategory) ? AVIF_PLANES_A : AVIF_PLANES_YUV);
@@ -6196,6 +6467,59 @@ static avifResult avifReadCodecConfigProperty(avifImage * image, const avifPrope
     return AVIF_RESULT_OK;
 }
 
+avifResult avifDecoderSetDecodeRegion(avifDecoder * decoder, const avifDecodeRegion * region)
+{
+    if (!decoder || !region) {
+        return AVIF_RESULT_INVALID_ARGUMENT;
+    }
+    if (region->width == 0 || region->height == 0) {
+        avifDiagnosticsPrintf(&decoder->diag, "Decode region must have a non-zero width and height");
+        return AVIF_RESULT_INVALID_ARGUMENT;
+    }
+    if (!decoder->data) {
+        // Nothing has been parsed yet; store the region, it will be validated at decode time.
+        decoder->decodeRegion = *region;
+        decoder->decodeRegionEnabled = AVIF_TRUE;
+        return AVIF_RESULT_OK;
+    }
+    // Validate against the parsed image so that invalid or unsupported requests fail at set time.
+    decoder->decodeRegion = *region;
+    decoder->decodeRegionEnabled = AVIF_TRUE;
+    const avifResult result = avifDecoderValidateDecodeRegion(decoder);
+    if (result != AVIF_RESULT_OK) {
+        // Keep the region stored so that the error is deterministic at decode time as well.
+        return result;
+    }
+    return AVIF_RESULT_OK;
+}
+
+void avifDecoderClearDecodeRegion(avifDecoder * decoder)
+{
+    if (!decoder) {
+        return;
+    }
+    decoder->decodeRegionEnabled = AVIF_FALSE;
+    decoder->decodeRegion = (avifDecodeRegion){ 0, 0, 0, 0 };
+}
+
+uint32_t avifDecoderGetTileCount(const avifDecoder * decoder)
+{
+    if (!decoder->data) {
+        return 0;
+    }
+    return decoder->data->tileInfos[AVIF_ITEM_COLOR].tileCount;
+}
+
+uint32_t avifDecoderGetDecodedTileCount(const avifDecoder * decoder)
+{
+    if (!decoder->data) {
+        return 0;
+    }
+    // decodedTileCount counts the tiles actually handed to the codec; skipped (out-of-region)
+    // tiles are never incremented, so it reflects the real amount of decoding work.
+    return decoder->data->tileInfos[AVIF_ITEM_COLOR].decodedTileCount;
+}
+
 avifResult avifDecoderReset(avifDecoder * decoder)
 {
     avifDiagnosticsClearError(&decoder->diag);
@@ -6823,7 +7147,20 @@ avifResult avifDecoderReset(avifDecoder * decoder)
 
 static avifResult avifDecoderPrepareTiles(avifDecoder * decoder, uint32_t nextImageIndex, const avifTileInfo * info)
 {
-    for (unsigned int tileIndex = info->decodedTileCount; tileIndex < info->tileCount; ++tileIndex) {
+    unsigned int tileIndexStart = info->decodedTileCount;
+    unsigned int tileIndexEnd = info->tileCount;
+    const avifBool regionApplies = avifDecoderRegionAppliesToCategory(decoder, info);
+    if (regionApplies) {
+        // Only the tiles intersecting the requested region need their sample data read from the IO.
+        avifDecoderGetRegionTileRange(decoder, info, &tileIndexStart, &tileIndexEnd);
+        if (info->decodedTileCount > tileIndexStart) {
+            tileIndexStart = info->decodedTileCount;
+        }
+    }
+    for (unsigned int tileIndex = tileIndexStart; tileIndex < tileIndexEnd; ++tileIndex) {
+        if (regionApplies && !avifDecoderIsTileInRegion(decoder, info, tileIndex)) {
+            continue;
+        }
         avifTile * tile = &decoder->data->tiles.tile[info->firstTileIndex + tileIndex];
 
         if (nextImageIndex >= tile->input->samples.count) {
@@ -6894,8 +7231,24 @@ static avifResult avifGetErrorForItemCategory(avifItemCategory itemCategory)
 
 static avifResult avifDecoderDecodeTiles(avifDecoder * decoder, uint32_t nextImageIndex, avifTileInfo * info)
 {
+    const avifBool regionApplies = avifDecoderRegionAppliesToCategory(decoder, info);
+    unsigned int regionTileIndexStart = 0;
+    unsigned int regionTileIndexEnd = info->tileCount;
+    if (regionApplies) {
+        avifDecoderGetRegionTileRange(decoder, info, &regionTileIndexStart, &regionTileIndexEnd);
+    }
+    const avifDecodeRegion * region = regionApplies ? &decoder->decodeRegion : NULL;
+
     const unsigned int oldDecodedTileCount = info->decodedTileCount;
-    for (unsigned int tileIndex = oldDecodedTileCount; tileIndex < info->tileCount; ++tileIndex) {
+    // In region mode decoding starts at the first covered tile; the (region-incompatible)
+    // incremental path is rejected up front, so oldDecodedTileCount is 0 here. When region decoding
+    // is not used, start from the first not-yet-decoded tile.
+    const unsigned int loopStart = regionApplies ? regionTileIndexStart : oldDecodedTileCount;
+    for (unsigned int tileIndex = loopStart; tileIndex < regionTileIndexEnd; ++tileIndex) {
+        if (regionApplies && !avifDecoderIsTileInRegion(decoder, info, tileIndex)) {
+            // This index is inside the region's bounding index range but not on the covered sub-grid.
+            continue;
+        }
         avifTile * tile = &decoder->data->tiles.tile[info->firstTileIndex + tileIndex];
 
         const avifDecodeSample * sample = &tile->input->samples.sample[nextImageIndex];
@@ -6965,6 +7318,11 @@ static avifResult avifDecoderDecodeTiles(avifDecoder * decoder, uint32_t nextIma
             // Keep everything as a copy for now.
             stealPlanes = AVIF_FALSE;
         }
+        if (regionApplies && !isGrid) {
+            // A single (non-grid) alpha tile of a region-decoded color grid must be cropped instead
+            // of stolen, since the output is region-sized.
+            stealPlanes = AVIF_FALSE;
+        }
         if (tile->input->itemCategory >= AVIF_SAMPLE_TRANSFORM_MIN_CATEGORY &&
             tile->input->itemCategory <= AVIF_SAMPLE_TRANSFORM_MAX_CATEGORY) {
             // Keep Sample Transform input image item samples in tiles.
@@ -6978,10 +7336,14 @@ static avifResult avifDecoderDecodeTiles(avifDecoder * decoder, uint32_t nextIma
                 AVIF_ASSERT_OR_RETURN(dstImage->gainMap && dstImage->gainMap->image);
                 dstImage = dstImage->gainMap->image;
             }
-            if (tileIndex == 0) {
-                AVIF_CHECKRES(avifDecoderDataAllocateImagePlanes(decoder->data, info, dstImage, &decoder->data->cicpSet));
+            // Allocate the output planes once, on the first decoded tile. Region decoding may start
+            // the loop at a non-zero tile index and a non-grid (single) alpha tile uses index 0.
+            const avifBool planesNeedAlloc = avifIsAlpha(tile->input->itemCategory) ? (dstImage->alphaPlane == NULL)
+                                                                                     : (dstImage->yuvPlanes[AVIF_CHAN_Y] == NULL);
+            if (planesNeedAlloc) {
+                AVIF_CHECKRES(avifDecoderDataAllocateImagePlanes(decoder, info, dstImage, &decoder->data->cicpSet));
             }
-            AVIF_CHECKRES(avifDecoderDataCopyTileToImage(decoder->data, info, dstImage, tile, tileIndex));
+            AVIF_CHECKRES(avifDecoderDataCopyTileToImage(decoder, info, dstImage, tile, tileIndex, region));
         } else {
             AVIF_ASSERT_OR_RETURN(info->tileCount == 1);
             AVIF_ASSERT_OR_RETURN(tileIndex == 0);
@@ -7022,10 +7384,23 @@ static avifResult avifDecoderDecodeTiles(avifDecoder * decoder, uint32_t nextIma
 }
 
 // Returns AVIF_FALSE if there is currently a partially decoded frame.
-static avifBool avifDecoderDataFrameFullyDecoded(const avifDecoderData * data)
+static avifBool avifDecoderDataFrameFullyDecoded(const avifDecoder * decoder)
 {
+    const avifDecoderData * data = decoder->data;
     for (int c = 0; c < AVIF_ITEM_CATEGORY_COUNT; ++c) {
-        if (data->tileInfos[c].decodedTileCount != data->tileInfos[c].tileCount) {
+        const avifTileInfo * info = &data->tileInfos[c];
+        if (avifDecoderRegionAppliesToCategory(decoder, info)) {
+            // The covered tiles form a sub-grid whose index range is not contiguous, so count them.
+            unsigned int expectedDecodedCount = 0;
+            for (unsigned int tileIndex = 0; tileIndex < info->tileCount; ++tileIndex) {
+                if (avifDecoderIsTileInRegion(decoder, info, tileIndex)) {
+                    ++expectedDecodedCount;
+                }
+            }
+            if (info->decodedTileCount != expectedDecodedCount) {
+                return AVIF_FALSE;
+            }
+        } else if (info->decodedTileCount != info->tileCount) {
             return AVIF_FALSE;
         }
     }
@@ -7071,10 +7446,10 @@ static avifResult avifDecoderApplySampleTransformForPlanesImpl(const avifDecoder
                 reconstructedInputImages[i]->width = decoder->image->width;
                 reconstructedInputImages[i]->height = decoder->image->height;
                 avifBool cicpSet = AVIF_TRUE;
-                AVIF_CHECKRES(avifDecoderDataAllocateImagePlanes(decoder->data, info, reconstructedInputImages[i], &cicpSet));
+                AVIF_CHECKRES(avifDecoderDataAllocateImagePlanes(decoder, info, reconstructedInputImages[i], &cicpSet));
                 for (unsigned int tileIndex = 0; tileIndex < info->tileCount; ++tileIndex) {
                     const avifTile * tile = firstTile + tileIndex;
-                    AVIF_CHECKRES(avifDecoderDataCopyTileToImage(decoder->data, info, reconstructedInputImages[i], tile, tileIndex));
+                    AVIF_CHECKRES(avifDecoderDataCopyTileToImage((avifDecoder *)decoder, info, reconstructedInputImages[i], tile, tileIndex, NULL));
                 }
                 inputImages[i] = reconstructedInputImages[i];
             }
@@ -7151,7 +7526,9 @@ avifResult avifDecoderNextImage(avifDecoder * decoder)
         return AVIF_RESULT_IO_NOT_SET;
     }
 
-    if (avifDecoderDataFrameFullyDecoded(decoder->data)) {
+    AVIF_CHECKRES(avifDecoderValidateDecodeRegion(decoder));
+
+    if (avifDecoderDataFrameFullyDecoded(decoder)) {
         // A frame was decoded during the last avifDecoderNextImage() call.
         for (int c = 0; c < AVIF_ITEM_CATEGORY_COUNT; ++c) {
             decoder->data->tileInfos[c].decodedTileCount = 0;
@@ -7187,7 +7564,7 @@ avifResult avifDecoderNextImage(avifDecoder * decoder)
         AVIF_CHECKRES(avifDecoderDecodeTiles(decoder, nextImageIndex, &decoder->data->tileInfos[c]));
     }
 
-    if (!avifDecoderDataFrameFullyDecoded(decoder->data)) {
+    if (!avifDecoderDataFrameFullyDecoded(decoder)) {
         AVIF_ASSERT_OR_RETURN(decoder->allowIncremental);
         // The image is not completely decoded. There should be no error unrelated to missing bytes,
         // and at least some missing bytes.
@@ -7287,7 +7664,7 @@ avifResult avifDecoderNthImage(avifDecoder * decoder, uint32_t frameIndex)
     }
 
     if (requestedIndex == decoder->imageIndex) {
-        if (avifDecoderDataFrameFullyDecoded(decoder->data)) {
+        if (avifDecoderDataFrameFullyDecoded(decoder)) {
             // The current fully decoded image (decoder->imageIndex) is requested, nothing to do
             return AVIF_RESULT_OK;
         }
